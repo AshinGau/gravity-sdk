@@ -127,12 +127,7 @@ fn run_reth(
                     reth_transaction_pool::blobstore::DiskFileBlobStore,
                 > = handle.node.pool;
 
-                let storage = BlockViewStorage::new(
-                    provider.clone(),
-                    latest_block.number,
-                    latest_block_hash,
-                    BTreeMap::new(),
-                );
+                let storage = BlockViewStorage::new(provider.clone());
                 let pipeline_api_v2: PipeExecLayerApi<BlockViewStorage<BlockchainProvider<NodeTypesWithDBAdapter<EthereumNode, Arc<DatabaseEnv>>>>> = reth_pipe_exec_layer_ext_v2::new_pipe_exec_layer_api(
                     chain_spec,
                     storage,
