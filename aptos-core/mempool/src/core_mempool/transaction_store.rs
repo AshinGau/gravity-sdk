@@ -220,7 +220,8 @@ impl TransactionStore {
             let mut added_count_this_batch = 0; // Track additions for this sender within the batch
 
             // Get a mutable reference to the sender's transaction map, creating if needed.
-             // We need this mutable reference early for gas upgrade logic and later insertions.
+            // We need this mutable reference early for gas upgrade logic and later insertions.
+            let accounts_len = self.transactions.len();
             let sender_storage_entry = self.transactions.entry(address).or_default();
 
             // --- Process Transactions for the Current Sender ---
@@ -258,8 +259,8 @@ impl TransactionStore {
                 if self.size_bytes >= self.capacity_bytes {
                      results[original_index] = Some(
                         MempoolStatus::new(MempoolStatusCode::MempoolIsFull).with_message(format!(
-                            "Mempool is full trying to insert {}:{}. Mempool size: {}, Capacity: {}",
-                            address, txn_seq_num, self.size_bytes, self.capacity,
+                            "Mempool is full trying to insert {}:{}. Mempool size: {}, Capacity: {}, Accounts: {}, Txs: {}",
+                            address, txn_seq_num, self.size_bytes, self.capacity_bytes, accounts_len, self.hash_index.len()
                         ))
                     );
                     continue; // Skip to next transaction
