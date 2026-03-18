@@ -237,27 +237,70 @@ impl BlockStore {
             self.storage.consensus_db().ledger_db.metadata_db().get_latest_ledger_info();
         info!("recover blocks, last_ledger_info: {:?}", last_ledger_info);
         certs.sort_unstable_by_key(|qc| qc.commit_info().round());
+
+        // Separate certs into two groups:
+        // Phase 1: already-committed blocks (commit_round <= last_ledger_info) — have verified hashes in DB
+        // Phase 2: ordered-but-uncommitted blocks (commit_round > last_ledger_info) — need fresh execution
+        let mut committed_certs = vec![];
+        let mut uncommitted_certs = vec![];
+
+        let last_committed_round = last_ledger_info.as_ref().map_or(0, |li| li.commit_info().round());
+        let last_committed_epoch = last_ledger_info.as_ref().map(|li| li.ledger_info().epoch());
+
         for qc in certs {
             if qc.commit_info().round() > self.commit_root().round() {
-                if let Some(last_ledger_info) = &last_ledger_info {
-                    if last_ledger_info.ledger_info().epoch() == qc.commit_info().epoch() &&
-                        qc.commit_info().round() <= last_ledger_info.commit_info().round()
-                    {
-                        info!(
-                            "sending qc {} to execution, current commit round {}",
-                            qc.commit_info().round(),
-                            self.commit_root().round()
-                        );
-                        if let Err(e) =
-                            self.send_for_execution(qc.into_wrapped_ledger_info(), true).await
-                        {
-                            error!("Error in try-committing blocks. {}", e.to_string());
-                            break;
+                if let Some(epoch) = last_committed_epoch {
+                    if epoch == qc.commit_info().epoch() {
+                        if qc.commit_info().round() <= last_committed_round {
+                            committed_certs.push(qc);
+                        } else {
+                            uncommitted_certs.push(qc);
                         }
                     }
                 }
             }
         }
+
+        // Phase 1: recover already-committed blocks
+        for qc in committed_certs {
+            info!(
+                "Phase 1: sending committed qc {} to execution, current commit round {}",
+                qc.commit_info().round(),
+                self.commit_root().round()
+            );
+            if let Err(e) =
+                self.send_for_execution(qc.into_wrapped_ledger_info(), true).await
+            {
+                error!("Error in try-committing blocks. {}", e.to_string());
+                RECOVERY_GAUGE.set_with(&[], 0);
+                return;
+            }
+        }
+
+        // Phase 2: recover ordered-but-uncommitted blocks to close the gap between
+        // commit_root and ordered_root, preventing vote_back_pressure deadlock
+        if !uncommitted_certs.is_empty() {
+            info!(
+                "Phase 2: recovering {} uncommitted ordered blocks (commit_round {} -> {})",
+                uncommitted_certs.len(),
+                self.commit_root().round(),
+                uncommitted_certs.last().map_or(0, |qc| qc.commit_info().round())
+            );
+        }
+        for qc in uncommitted_certs {
+            info!(
+                "Phase 2: recovering uncommitted ordered block at round {}, current commit round {}",
+                qc.commit_info().round(),
+                self.commit_root().round()
+            );
+            if let Err(e) =
+                self.send_for_execution(qc.into_wrapped_ledger_info(), true).await
+            {
+                error!("Error recovering uncommitted ordered block. {}", e.to_string());
+                break;
+            }
+        }
+
         RECOVERY_GAUGE.set_with(&[], 0);
     }
 
