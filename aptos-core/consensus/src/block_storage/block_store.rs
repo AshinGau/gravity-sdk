@@ -85,6 +85,16 @@ static CUR_RECOVER_BLOCK_NUMBER_GAUGE: Lazy<IntGaugeVec> = Lazy::new(|| {
 static RECOVERY_GAUGE: Lazy<IntGaugeVec> =
     Lazy::new(|| register_int_gauge_vec!("aptos_recovery", "is recovery or not", &[]).unwrap());
 
+/// Fast-sync execute look-ahead depth (opt-in). 1 = original strictly-serial recovery.
+/// Set FAST_SYNC_EXECUTE_LOOKAHEAD>1 (PFN/VFN only) to pipeline the consensus->execution feed.
+fn fast_sync_execute_lookahead() -> usize {
+    std::env::var("FAST_SYNC_EXECUTE_LOOKAHEAD")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(1)
+        .max(1)
+}
+
 static SET_RANDOMNESS_FROM_DB_COUNTER: Lazy<IntGaugeVec> = Lazy::new(|| {
     register_int_gauge_vec!(
         "aptos_set_randomness_from_db_total",
@@ -260,31 +270,51 @@ impl BlockStore {
 
         certs.sort_unstable_by_key(|qc| qc.commit_info().round());
 
-        for qc in certs {
-            let commit_round = qc.commit_info().round();
-
-            if commit_round <= self.commit_root().round() {
-                continue;
+        let committable = |qc: &QuorumCert| -> bool {
+            let cr = qc.commit_info().round();
+            cr > self.commit_root().round()
+                && last_ledger_info.as_ref().map_or(false, |li| {
+                    li.ledger_info().epoch() == qc.commit_info().epoch()
+                        && cr <= li.commit_info().round()
+                })
+        };
+        if fast_sync_execute_lookahead() > 1 {
+            // Pipelined fast-sync: commit up to the HIGHEST committable QC in a single
+            // send_for_execution call, so its recovery loop can look ahead across the whole path
+            // (instead of recover_blocks feeding execution one block per QC, lockstep).
+            // commit_callback commits/prunes up to blocks_to_commit.last() and overwrites
+            // highest_commit_cert, so one call reaches the same end-state as the per-QC sequence.
+            if let Some(qc) = certs.into_iter().filter(|qc| committable(qc)).last() {
+                info!(
+                    "recover_blocks: pipelined commit up to round {} (lookahead={}, commit_root={})",
+                    qc.commit_info().round(),
+                    fast_sync_execute_lookahead(),
+                    self.commit_root().round(),
+                );
+                if let Err(e) = self
+                    .send_for_execution(qc.into_wrapped_ledger_info(), true, epoch_change_block_number)
+                    .await
+                {
+                    error!("recover_blocks: pipelined commit failed: {e}");
+                }
             }
-
-            let Some(last_li) = &last_ledger_info else { continue };
-            if last_li.ledger_info().epoch() != qc.commit_info().epoch() ||
-                commit_round > last_li.commit_info().round()
-            {
-                continue;
-            }
-
-            info!(
-                "recover_blocks: sending round {} to execution (commit_root={})",
-                commit_round,
-                self.commit_root().round(),
-            );
-            if let Err(e) = self
-                .send_for_execution(qc.into_wrapped_ledger_info(), true, epoch_change_block_number)
-                .await
-            {
-                error!("recover_blocks: failed to commit blocks: {e}");
-                break;
+        } else {
+            for qc in certs {
+                if !committable(&qc) {
+                    continue;
+                }
+                info!(
+                    "recover_blocks: sending round {} to execution (commit_root={})",
+                    qc.commit_info().round(),
+                    self.commit_root().round(),
+                );
+                if let Err(e) = self
+                    .send_for_execution(qc.into_wrapped_ledger_info(), true, epoch_change_block_number)
+                    .await
+                {
+                    error!("recover_blocks: failed to commit blocks: {e}");
+                    break;
+                }
             }
         }
 
@@ -532,6 +562,110 @@ impl BlockStore {
     }
 
     /// Send an ordered block id with the proof for execution, returns () on success or error
+    /// Build the ExternalBlock to feed execution for one recovery block, plus the expected block
+    /// hash (state root) from the ledger DB (None if not yet recorded) and the block number.
+    /// Shared by the strictly-serial and the look-ahead recovery paths so they stay identical.
+    async fn prepare_recovery_block(
+        &self,
+        p_block: &Arc<PipelinedBlock>,
+    ) -> anyhow::Result<(ExternalBlock, Option<ComputeRes>, u64)> {
+        let mut txns = vec![];
+        loop {
+            match self.payload_manager.get_transactions(p_block.block()).await {
+                Ok((mut txns_, _)) => {
+                    txns.append(&mut txns_);
+                    break;
+                }
+                Err(e) => {
+                    warn!("get transaction error {}", e);
+                    if let Some(payload) = p_block.block().payload() {
+                        self.payload_manager
+                            .prefetch_payload_data(payload, p_block.block().timestamp_usecs());
+                    }
+                }
+            }
+        }
+        info!("recover block {}, txn_size: {}", p_block.block(), txns.len());
+        let verified_txns: Vec<VerifiedTxn> = txns.iter().map(|txn| txn.into()).collect();
+        let txn_num = verified_txns.len() as u64;
+        let verified_txns = verified_txns.into_iter().map(|txn| txn.into()).collect();
+        let block_number = p_block
+            .block()
+            .block_number()
+            .ok_or_else(|| format_err!("Block number not found for block {}", p_block.block().id()))?;
+        let block_number_i64: i64 = block_number
+            .try_into()
+            .map_err(|_| format_err!("Block number {} is too large to convert to i64", block_number))?;
+        CUR_RECOVER_BLOCK_NUMBER_GAUGE.with_label_values(&[]).set(block_number_i64);
+        let maybe_block_hash = match self
+            .storage
+            .consensus_db()
+            .ledger_db
+            .metadata_db()
+            .get_block_hash(block_number)
+        {
+            Some(block_hash) => Some(ComputeRes::new(*block_hash, txn_num, vec![], vec![])),
+            None => None,
+        };
+        let validator_txns = p_block.block().validator_txns();
+        let extra_data = crate::state_computer::process_validator_transactions_util(
+            validator_txns.map(|v| &**v),
+            p_block.block(),
+        );
+        let randomness = if self.enable_randomness && p_block.epoch() != 1 {
+            match p_block.randomness() {
+                Some(r) => Some(Random::from_bytes(r.randomness())),
+                None => {
+                    self.try_set_randomness_from_db(p_block, p_block.block());
+                    match p_block.randomness() {
+                        Some(r) => Some(Random::from_bytes(r.randomness())),
+                        None => {
+                            return Err(anyhow::anyhow!(
+                                "Randomness is required but not found in block {}, block_number={}",
+                                p_block.block().id(),
+                                block_number,
+                            ));
+                        }
+                    }
+                }
+            }
+        } else {
+            None
+        };
+        let proposer_index = p_block
+            .block()
+            .author()
+            .and_then(|author| self.validator_indices.get(&author).copied())
+            .map(|i| i as u64);
+        let block = ExternalBlock {
+            txns: verified_txns,
+            block_meta: ExternalBlockMeta {
+                block_id: BlockId(*p_block.block().id()),
+                block_number,
+                usecs: p_block.block().timestamp_usecs(),
+                epoch: p_block.block().epoch(),
+                randomness,
+                block_hash: maybe_block_hash.clone(),
+                proposer_index,
+                failed_proposer_indices: p_block
+                    .block()
+                    .block_data()
+                    .failed_authors()
+                    .map_or(vec![], |authors| {
+                        authors
+                            .iter()
+                            .filter_map(|(_round, author)| {
+                                self.validator_indices.get(author).map(|i| *i as u64)
+                            })
+                            .collect()
+                    }),
+            },
+            extra_data,
+            enable_randomness: self.enable_randomness,
+        };
+        Ok((block, maybe_block_hash, block_number))
+    }
+
     pub async fn send_for_execution(
         &self,
         finality_proof: WrappedLedgerInfo,
@@ -613,135 +747,67 @@ impl BlockStore {
             } else {
                 blocks_to_commit
             };
-            for p_block in &blocks_to_commit {
-                let mut txns = vec![];
-                loop {
-                    match self.payload_manager.get_transactions(p_block.block()).await {
-                        Ok((mut txns_, _)) => {
-                            txns.append(&mut txns_);
-                            break;
+            // Bounded look-ahead pipeline: feed up to `lookahead` blocks to execution before
+            // draining results, so consensus->execution is not lockstep-per-block. set_commit and
+            // per-block ack/persist are preserved (drain commits one block at a time, in order).
+            // lookahead==1 is byte-for-byte the original strictly-serial behavior. The per-block
+            // state-root comparison (expected vs computed) is kept for every block.
+            let lookahead = fast_sync_execute_lookahead();
+            let mut inflight: std::collections::VecDeque<(Arc<PipelinedBlock>, Option<ComputeRes>, u64)> =
+                std::collections::VecDeque::new();
+            let mut iter = blocks_to_commit.iter();
+            let mut feed_done = false;
+            while !feed_done || !inflight.is_empty() {
+                while inflight.len() < lookahead && !feed_done {
+                    match iter.next() {
+                        Some(p_block) => {
+                            let (block, expected_hash, block_number) =
+                                self.prepare_recovery_block(p_block).await?;
+                            get_block_buffer_manager()
+                                .set_ordered_blocks(BlockId(*p_block.parent_id()), block, p_block.round())
+                                .await
+                                .context("Failed to set ordered blocks during recovery")?;
+                            inflight.push_back((p_block.clone(), expected_hash, block_number));
                         }
-                        Err(e) => {
-                            warn!("get transaction error {}", e);
-                            if let Some(payload) = p_block.block().payload() {
-                                self.payload_manager.prefetch_payload_data(
-                                    payload,
-                                    p_block.block().timestamp_usecs(),
-                                );
-                            }
-                        }
+                        None => feed_done = true,
                     }
                 }
-                info!("recover block {}, txn_size: {}", p_block.block(), txns.len());
-                let verified_txns: Vec<VerifiedTxn> = txns.iter().map(|txn| txn.into()).collect();
-                let txn_num = verified_txns.len() as u64;
-                let verified_txns = verified_txns.into_iter().map(|txn| txn.into()).collect();
-                let block_number = p_block.block().block_number().ok_or_else(|| {
-                    format_err!("Block number not found for block {}", p_block.block().id())
-                })?;
-                let block_number_i64: i64 = block_number.try_into().map_err(|_| {
-                    format_err!("Block number {} is too large to convert to i64", block_number)
-                })?;
-                CUR_RECOVER_BLOCK_NUMBER_GAUGE.with_label_values(&[]).set(block_number_i64);
-                let maybe_block_hash = match self
-                    .storage
-                    .consensus_db()
-                    .ledger_db
-                    .metadata_db()
-                    .get_block_hash(block_number)
-                {
-                    Some(block_hash) => Some(ComputeRes::new(*block_hash, txn_num, vec![], vec![])),
-                    None => None,
-                };
-
-                let validator_txns = p_block.block().validator_txns();
-                let extra_data = crate::state_computer::process_validator_transactions_util(
-                    validator_txns.map(|v| &**v),
-                    p_block.block(),
-                );
-
-                // In recovery mode, use existing randomness from the block
-                let randomness = if self.enable_randomness && p_block.epoch() != 1 {
-                    match p_block.randomness() {
-                        Some(r) => Some(Random::from_bytes(r.randomness())),
-                        None => {
-                            self.try_set_randomness_from_db(&p_block, p_block.block());
-                            match p_block.randomness() {
-                                Some(r) => Some(Random::from_bytes(r.randomness())),
-                                None => {
-                                    return Err(anyhow::anyhow!(
-                                        "Randomness is required but not found in block {}, block_number={}",
-                                        p_block.block().id(),
-                                        block_number,
-                                    ));
-                                }
-                            }
-                        }
+                if let Some((p_block, expected_hash, block_number)) = inflight.pop_front() {
+                    let compute_res = get_block_buffer_manager()
+                        .get_executed_res(
+                            BlockId(*p_block.id()),
+                            block_number,
+                            p_block.block().epoch(),
+                        )
+                        .await
+                        .context(format!(
+                            "Failed to get executed result for block {} during recovery",
+                            p_block.block().id()
+                        ))?;
+                    let compute_res = compute_res.execution_output;
+                    if let Some(block_hash) = expected_hash {
+                        ensure!(
+                            block_hash.data == compute_res.data,
+                            "state root mismatch during recovery at block {} (number {}): expected {:?}, computed {:?}",
+                            p_block.block().id(),
+                            block_number,
+                            block_hash.data,
+                            compute_res.data,
+                        );
                     }
-                } else {
-                    None
-                };
-
-                // Look up the proposer's index in the validator set (None for NIL blocks)
-                let proposer_index = p_block
-                    .block()
-                    .author()
-                    .and_then(|author| self.validator_indices.get(&author).copied())
-                    .map(|i| i as u64);
-
-                let block = ExternalBlock {
-                    txns: verified_txns,
-                    block_meta: ExternalBlockMeta {
-                        block_id: BlockId(*p_block.block().id()),
-                        block_number,
-                        usecs: p_block.block().timestamp_usecs(),
-                        epoch: p_block.block().epoch(),
-                        randomness,
-                        block_hash: maybe_block_hash.clone(),
-                        proposer_index,
-                        failed_proposer_indices: p_block
-                            .block()
-                            .block_data()
-                            .failed_authors()
-                            .map_or(vec![], |authors| {
-                                authors
-                                    .iter()
-                                    .filter_map(|(_round, author)| {
-                                        self.validator_indices.get(author).map(|i| *i as u64)
-                                    })
-                                    .collect()
-                            }),
-                    },
-                    extra_data,
-                    enable_randomness: self.enable_randomness,
-                };
-                get_block_buffer_manager()
-                    .set_ordered_blocks(BlockId(*p_block.parent_id()), block, p_block.round())
-                    .await
-                    .context("Failed to set ordered blocks during recovery")?;
-                let compute_res = get_block_buffer_manager()
-                    .get_executed_res(BlockId(*p_block.id()), block_number, p_block.block().epoch())
-                    .await
-                    .context(format!(
-                        "Failed to get executed result for block {} during recovery",
-                        p_block.block().id()
-                    ))?;
-                let compute_res = compute_res.execution_output;
-                if let Some(block_hash) = maybe_block_hash {
-                    assert_eq!(block_hash.data, compute_res.data);
-                }
-                let commit_block = BlockHashRef {
-                    block_id: BlockId(*p_block.id()),
-                    num: block_number,
-                    hash: Some(compute_res.data),
-                    persist_notifier: None,
-                };
-                let mut persist_notifiers = get_block_buffer_manager()
-                    .set_commit_blocks(vec![commit_block], p_block.block().epoch())
-                    .await
-                    .context("Failed to set commit blocks during recovery")?;
-                for notifier in persist_notifiers.iter_mut() {
-                    let _ = notifier.recv().await;
+                    let commit_block = BlockHashRef {
+                        block_id: BlockId(*p_block.id()),
+                        num: block_number,
+                        hash: Some(compute_res.data),
+                        persist_notifier: None,
+                    };
+                    let mut persist_notifiers = get_block_buffer_manager()
+                        .set_commit_blocks(vec![commit_block], p_block.block().epoch())
+                        .await
+                        .context("Failed to set commit blocks during recovery")?;
+                    for notifier in persist_notifiers.iter_mut() {
+                        let _ = notifier.recv().await;
+                    }
                 }
             }
             let commit_decision = finality_proof.ledger_info().clone();
